@@ -17,23 +17,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Attention backend: try FA3 kernel first (fast on Hopper). Fall back to SDPA
-# on architectures where the prebuilt FA3 kernel image is missing (e.g.
-# Blackwell sm_120 / RTX 5090 — `kernels-community/flash-attn3` has no
-# sm_120 binary at time of writing). SDPA is slower but portable.
+# Attention backend.
+# FA3 is fast on Hopper (sm_90, H100/H200) but the prebuilt kernels shipped
+# by HuggingFace's `kernels-community/flash-attn3` do NOT include binaries for
+# Blackwell consumer (sm_120, RTX 5090). When the kernel image is missing,
+# CUDA aborts the process at launch time — a failure mode that cannot be
+# caught from Python (no exception is raised). So we gate FA3 on compute
+# capability rather than try/except.
 _USE_FA3 = False
-try:
-    from kernels import get_kernel
-    cap = torch.cuda.get_device_capability()
-    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-    fa3 = get_kernel(repo).flash_attn_interface
-    # Smoke test: try a tiny call to catch "no kernel image" errors early.
-    _q = torch.zeros(1, 8, 1, 64, dtype=torch.bfloat16, device="cuda")
-    fa3.flash_attn_func(_q, _q, _q, causal=True, window_size=(0, 0))
-    _USE_FA3 = True
-    print(f"Attention backend: FA3 ({repo})")
-except Exception as _fa3_err:
-    print(f"Attention backend: SDPA (FA3 unavailable: {type(_fa3_err).__name__}: {_fa3_err})")
+_cap = torch.cuda.get_device_capability()
+if _cap == (9, 0):
+    try:
+        from kernels import get_kernel
+        fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface
+        _USE_FA3 = True
+        print(f"Attention backend: FA3 (Hopper sm_{_cap[0]}{_cap[1]})")
+    except Exception as _fa3_err:
+        print(f"Attention backend: SDPA (FA3 import failed: {type(_fa3_err).__name__}: {_fa3_err})")
+else:
+    print(f"Attention backend: SDPA (compute capability sm_{_cap[0]}{_cap[1]} — FA3 disabled, only enabled on Hopper sm_90)")
 
 _window_mask_cache: dict = {}
 
