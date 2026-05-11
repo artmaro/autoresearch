@@ -503,7 +503,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 32  # per-device batch size (reduce if OOM). Was 128 on H100 80GB; RTX 5090 has 32GB.
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
