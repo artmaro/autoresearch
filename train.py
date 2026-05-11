@@ -17,11 +17,64 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# Attention backend: try FA3 kernel first (fast on Hopper). Fall back to SDPA
+# on architectures where the prebuilt FA3 kernel image is missing (e.g.
+# Blackwell sm_120 / RTX 5090 — `kernels-community/flash-attn3` has no
+# sm_120 binary at time of writing). SDPA is slower but portable.
+_USE_FA3 = False
+try:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    # Smoke test: try a tiny call to catch "no kernel image" errors early.
+    _q = torch.zeros(1, 8, 1, 64, dtype=torch.bfloat16, device="cuda")
+    fa3.flash_attn_func(_q, _q, _q, causal=True, window_size=(0, 0))
+    _USE_FA3 = True
+    print(f"Attention backend: FA3 ({repo})")
+except Exception as _fa3_err:
+    print(f"Attention backend: SDPA (FA3 unavailable: {type(_fa3_err).__name__}: {_fa3_err})")
+
+_window_mask_cache: dict = {}
+
+def _sliding_window_causal_mask(T: int, window: int, device):
+    """Boolean mask for SDPA: True = allowed, False = masked.
+
+    Each query position i attends to keys in [max(0, i - window), i] (causal + sliding).
+    Cached per (T, window, device).
+    """
+    key = (T, window, device)
+    cached = _window_mask_cache.get(key)
+    if cached is not None:
+        return cached
+    i = torch.arange(T, device=device).view(-1, 1)
+    j = torch.arange(T, device=device).view(1, -1)
+    mask = (j <= i) & (i - j <= window)
+    _window_mask_cache[key] = mask
+    return mask
+
+
+def attention(q, k, v, window_size):
+    """Causal (optionally sliding-window) attention.
+
+    Inputs: q, k, v shaped (B, T, H, D) or (B, T, H_kv, D) for GQA.
+    Output: (B, T, H, D).
+    """
+    if _USE_FA3:
+        return fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+    # SDPA path: (B, T, H, D) -> (B, H, T, D)
+    B, T, _, _ = q.shape
+    q_s = q.transpose(1, 2)
+    k_s = k.transpose(1, 2)
+    v_s = v.transpose(1, 2)
+    window = window_size[0]
+    if window <= 0 or window >= T:
+        y = F.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=True, enable_gqa=True)
+    else:
+        mask = _sliding_window_causal_mask(T, window, q.device)
+        y = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=mask, enable_gqa=True)
+    return y.transpose(1, 2)
+
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +143,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
